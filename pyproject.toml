@@ -1,0 +1,10 @@
+[project]
+name = "gentooinstall"
+version = "0.1.0"
+description = "Guided TUI installer for Gentoo Linux (stdlib only)"
+requires-python = ">=3.9"
+[project.scripts]
+gentooinstall = "gentooinstall.__main__:main"
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
