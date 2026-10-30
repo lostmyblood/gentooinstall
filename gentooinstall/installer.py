@@ -1,6 +1,7 @@
 """Installation engine: follows the Gentoo handbook, driven by a Config."""
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -10,12 +11,13 @@ import subprocess
 import sys
 import time
 
+from .disklayout import GUID_BIOS, MIB, layout_for
 from .config import (DESKTOPS, KERNELS, TARGET, VIDEO_CARDS, Config, profile_name, stage3_flavor)
 from .system import (InstallError, Runner, check_environment, detect_gpus, download, fetch_text,
                      is_uefi, log, mem_gib, say)
 
 GENTOO_KEY = "/usr/share/openpgp-keys/gentoo-release.asc"
-BLUE, BOLD, RST = "\033[38;5;67m", "\033[1m", "\033[0m"
+BOLD, RST = "\033[1m", "\033[0m"
 BIOS_BOOT_GUID = "21686148-6449-6E6F-744E-656564454649"
 CRYPT_NAME = "cryptroot"
 
@@ -31,7 +33,7 @@ class Installer:
         self.root_uuid = ""
         self.luks_uuid = ""
         self.root_flags = ""
-        self.swap_dev = ""
+        self.swap_devs: list[str] = []
         self.encrypted = False
         self.chroot_ready = False
         self.partitioned = False
@@ -126,7 +128,7 @@ class Installer:
         """Unmount everything, close LUKS, swapoff. Partition changes already made are NOT undone."""
         say("warn", "Rolling back: unmounting target and closing encrypted volumes...")
         self.cleanup(quiet=True)
-        if self.cfg.disk_mode == "auto" and self.partitioned:
+        if self.cfg.disk_mode != "premounted" and self.partitioned:
             say("warn", f"{self.cfg.disk} was already repartitioned; its old contents are gone. "
                         f"Re-run the installer to start over.")
         say("info", "Log: /var/log/gentooinstall/install.log")
@@ -142,7 +144,7 @@ class Installer:
         if self.dry:
             return
         need = ["chroot", "tar", "blkid", "mount", "umount"]
-        if self.cfg.disk_mode == "auto":
+        if self.cfg.disk_mode != "premounted":
             need += ["sfdisk", "wipefs", "udevadm"]
         if self.cfg.encrypt:
             need.append("cryptsetup")
@@ -152,47 +154,50 @@ class Installer:
 
     # ------------------------------------------------------------------ disks
     def prepare_disk(self) -> None:
-        if self.cfg.disk_mode == "auto":
+        if self.cfg.disk_mode != "premounted":
             self.cleanup(quiet=True)      # makes retries safe (never touches user mounts in premounted mode)
-        self.fstab, self.swap_dev, self.encrypted, self.root_flags = [], "", False, ""
+        self.fstab, self.swap_devs, self.encrypted, self.root_flags = [], [], False, ""
         if self.cfg.disk_mode == "premounted":
             self.detect_premounted()
         else:
             self.partition_format_mount()
 
     def partition_format_mount(self) -> None:
+        """Apply the layout (default or manual): partition, format, encrypt, mount."""
         c, r = self.cfg, self.r
         disk = c.disk
-        sep_boot = c.encrypt and (c.bootloader == "grub")
-        lines = ["label: gpt"]
-        roles: list[str] = []
-        if self.uefi:
-            lines.append("size=1GiB, type=U"); roles.append("esp")
-        elif c.bootloader == "grub":
-            lines.append(f"size=1MiB, type={BIOS_BOOT_GUID}"); roles.append("bios")
-        if sep_boot:
-            lines.append("size=1GiB, type=L"); roles.append("boot")
-        if c.swap_gib > 0:
-            lines.append(f"size={c.swap_gib}GiB, type=S"); roles.append("swap")
-        lines.append("type=L"); roles.append("root")
-        dev = {role: self.part(disk, i + 1) for i, role in enumerate(roles)}
+        layout = layout_for(c, self.uefi)
+        parts = [p for p in layout if not p.delete]
+        kept = [p for p in parts if p.existing]
+        new = sorted((p for p in parts if not p.existing), key=lambda p: p.start)
 
-        r.run(["wipefs", "--all", "--force", disk])
-        self.partitioned = True
-        r.run(["sfdisk", "--wipe", "always", "--wipe-partitions", "always", disk],
-              stdin="\n".join(lines) + "\n")
+        # 1. partition table
+        if not kept:                                     # nothing to preserve: fresh GPT
+            r.run(["wipefs", "--all", "--force", disk])
+            r.run(["sfdisk", disk], stdin="label: gpt\n")
+        else:
+            for p in layout:
+                if p.existing and p.delete:
+                    r.run(["sfdisk", "--delete", disk, str(p.num)])
+        lines = []
+        for p in new:
+            typ = GUID_BIOS if p.fs == "bios_boot" else "U" if p.esp else "S" if p.fs == "swap" else "L"
+            lines.append(f"start={p.start}MiB" + (f", size={p.size}MiB" if p.size else "") + f", type={typ}")
+        if lines:
+            r.run(["sfdisk", "--append", disk], stdin="\n".join(lines) + "\n")
         r.run(["udevadm", "settle"])
+        r.run(["partprobe", disk], check=False)
+        self.assign_nodes(disk, new)
 
-        if "esp" in dev:
-            r.run(["mkfs.vfat", "-F", "32", dev["esp"]])
-        if "boot" in dev:
-            r.run(["mkfs.ext4", "-F", dev["boot"]])
-        if "swap" in dev:
-            r.run(["mkswap", dev["swap"]])
-            r.run(["swapon", dev["swap"]])
-            self.swap_dev = dev["swap"]
-
-        root_dev = dev["root"]
+        # 2. filesystems
+        root = next(p for p in parts if p.mount == "/")
+        for p in parts:
+            if p.fs == "bios_boot" or (p.existing and not p.fmt) or (p is root and c.encrypt):
+                continue
+            if p.existing:
+                r.run(["wipefs", "--all", "--force", p.node])
+            self.mkfs(p.node, p.fs)
+        root_dev = root.node
         if c.encrypt:
             pw = c.luks_password
             r.run(["cryptsetup", "luksFormat", "--batch-mode", "--type", "luks2",
@@ -201,22 +206,23 @@ class Installer:
             self.luks_uuid = self.uuid(root_dev)
             self.encrypted = True
             root_dev = f"/dev/mapper/{CRYPT_NAME}"
-
-        mkfs = {"ext4": ["mkfs.ext4", "-F"], "xfs": ["mkfs.xfs", "-f"],
-                "btrfs": ["mkfs.btrfs", "-f"], "f2fs": ["mkfs.f2fs", "-f"]}[c.filesystem]
-        r.run(mkfs + [root_dev])
+            self.mkfs(root_dev, root.fs)
         self.root_uuid = self.uuid(root_dev)
+
+        # 3. mount (root first, then by depth) and build fstab
         t = self.target
         r.run(["mkdir", "-p", t])
-
-        if c.filesystem == "btrfs" and c.btrfs_subvolumes:
+        if root.fs == "btrfs" and c.btrfs_subvolumes:
             r.run(["mount", root_dev, t])
             subvols = [("@", "/"), ("@home", "/home"), ("@var_log", "/var/log"), ("@snapshots", "/.snapshots")]
             for name, _ in subvols:
                 r.run(["btrfs", "subvolume", "create", f"{t}/{name}"])
             r.run(["umount", t])
             base = "noatime,compress=zstd"
+            skip_home = any(p.mount == "/home" for p in parts)
             for name, mnt in subvols:
+                if name == "@home" and skip_home:
+                    continue
                 dest = t + (mnt if mnt != "/" else "")
                 r.run(["mkdir", "-p", dest])
                 r.run(["mount", "-o", f"{base},subvol={name}", root_dev, dest])
@@ -224,17 +230,45 @@ class Installer:
             self.root_flags = "rootflags=subvol=@"
         else:
             r.run(["mount", root_dev, t])
-            self.add_fstab(root_dev, "/", c.filesystem, "defaults,noatime", 0 if c.filesystem in ("btrfs", "xfs", "f2fs") else 1)
-        if "boot" in dev:
-            r.run(["mkdir", "-p", f"{t}/boot"])
-            r.run(["mount", dev["boot"], f"{t}/boot"])
-            self.add_fstab(dev["boot"], "/boot", "ext4", "defaults,noatime", 2)
-        if "esp" in dev:
-            r.run(["mkdir", "-p", f"{t}/efi"])
-            r.run(["mount", dev["esp"], f"{t}/efi"])
-            self.add_fstab(dev["esp"], "/efi", "vfat", "umask=0077", 2)
-        if self.swap_dev:
-            self.fstab.append((f"UUID={self.uuid(self.swap_dev)}", "none", "swap", "sw", 0))
+            self.add_fstab(root_dev, "/", root.fs, "defaults,noatime", 1 if root.fs == "ext4" else 0)
+        for p in sorted((p for p in parts if p.mount and p is not root),
+                        key=lambda p: (p.mount.count("/"), p.mount)):
+            fstype = self.fstype(p)
+            dest = t + p.mount
+            r.run(["mkdir", "-p", dest])
+            r.run(["mount", p.node, dest])
+            opts = "umask=0077" if fstype == "vfat" else "defaults,noatime"
+            self.add_fstab(p.node, p.mount, fstype, opts, 2 if fstype in ("ext4", "vfat") else 0)
+        for p in parts:
+            if p.fs == "swap":
+                r.run(["swapon", p.node])
+                self.swap_devs.append(p.node)
+                self.fstab.append((f"UUID={self.uuid(p.node)}", "none", "swap", "sw", 0))
+
+    def assign_nodes(self, disk: str, new) -> None:
+        """Find the /dev node of every newly created partition (matched by start sector)."""
+        if self.dry:
+            for i, p in enumerate(new, 1):
+                p.node = self.part(disk, i)
+            return
+        out = self.r.run(["sfdisk", "-J", disk], quiet=True)
+        table = json.loads(out)["partitiontable"]
+        ss = int(table.get("sectorsize", 512))
+        by_start = {q["start"]: q["node"] for q in table["partitions"]}
+        for p in new:
+            node = by_start.get(p.start * MIB // ss)
+            if not node:
+                raise InstallError(f"Could not find the new partition starting at {p.start} MiB")
+            p.node = node
+
+    def mkfs(self, dev: str, fs: str) -> None:
+        cmd = {"fat32": ["mkfs.vfat", "-F", "32"], "swap": ["mkswap", "-f"], "ext4": ["mkfs.ext4", "-F"],
+               "xfs": ["mkfs.xfs", "-f"], "btrfs": ["mkfs.btrfs", "-f"], "f2fs": ["mkfs.f2fs", "-f"]}[fs]
+        self.r.run(cmd + [dev])
+
+    def fstype(self, p) -> str:
+        fs = p.fs if (p.fmt or not p.existing) else (p.old_fs or p.fs)
+        return "vfat" if fs == "fat32" else fs
 
     def detect_premounted(self) -> None:
         """Use whatever is mounted under /mnt/gentoo (root, /boot, /efi, /home ...)."""
@@ -335,6 +369,8 @@ class Installer:
         cards: list[str] = []
         for k in sorted(keys):
             cards += VIDEO_CARDS.get(k, "").split()
+        if not cards and c.profile_type == "desktop":
+            cards = ["fbdev", "vesa"]                 # X still starts on unknown hardware / some VMs
         return " ".join(dict.fromkeys(cards))
 
     def portage(self) -> None:
@@ -353,6 +389,8 @@ class Installer:
         mk = ["", "# --- added by gentooinstall ---", f'MAKEOPTS="-j{jobs}"',
               'ACCEPT_LICENSE="-* @FREE @BINARY-REDISTRIBUTABLE"',
               f'GENTOO_MIRRORS="{c.mirror.rstrip("/")}"']
+        if self.dry and not vc and c.profile_type == "desktop":
+            vc = "fbdev vesa"
         if vc and (c.profile_type == "desktop" or c.graphics != "auto"):
             mk.append(f'VIDEO_CARDS="{vc}"')
         if c.bootloader == "grub":
@@ -527,24 +565,37 @@ class Installer:
                 self.c("systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service", check=False)
         if c.profile_type != "desktop":
             return
-        de = DESKTOPS[c.desktop]
-        pkgs = list(de["pkgs"])
-        dm = de["dm"]
-        if dm:
-            pkgs.append(dm[1])
-            if dm[0] == "lightdm":
-                pkgs.append("x11-misc/lightdm-gtk-greeter")
-        if c.init_system == "openrc" and dm:
-            pkgs.append("gui-libs/display-manager-init")
+        # exactly the package set of the chosen desktop, plus Xorg's input/video driver meta package
+        pkgs = list(DESKTOPS[c.desktop]["pkgs"]) + ["x11-base/xorg-drivers"]
+        if c.init_system == "openrc":
+            pkgs += ["sys-auth/elogind", "sys-apps/dbus"]
         self.emerge("--noreplace " + " ".join(pkgs))
         if c.init_system == "openrc":
             self.enable("elogind", "boot")
             self.enable("dbus")
-            if dm:
-                self.r.write("/etc/conf.d/display-manager", f'DISPLAYMANAGER="{dm[0]}"\n')
+        self.greeter()
+
+    def greeter(self) -> None:
+        c, r = self.cfg, self.r
+        if c.greeter == "sddm":
+            self.emerge("--noreplace x11-misc/sddm" + (" gui-libs/display-manager-init" if c.init_system == "openrc" else ""))
+            if c.init_system == "openrc":
+                r.write("/etc/conf.d/display-manager", 'DISPLAYMANAGER="sddm"\n')
                 self.enable("display-manager")
-        elif dm:
-            self.c(f"systemctl enable {dm[0]}")
+            else:
+                self.c("systemctl enable sddm")
+        elif c.greeter == "ly":
+            # ly lives in the GURU overlay (not in ::gentoo) and is keyworded ~amd64
+            self.emerge("--noreplace app-eselect/eselect-repository dev-vcs/git")
+            self.c("eselect repository enable guru && emaint sync -r guru")
+            r.write("/etc/portage/package.accept_keywords/ly", "x11-misc/ly ~amd64\n")
+            r.write("/etc/portage/package.use/ly", f"x11-misc/ly {'systemd' if c.init_system == 'systemd' else 'openrc'}\n")
+            self.c("emerge --verbose --quiet-build=y --noreplace --autounmask=y --autounmask-continue=y x11-misc/ly")
+            if c.init_system == "openrc":
+                self.c("sed -i 's/^c2:/#c2:/' /etc/inittab")      # ly runs on tty2
+                self.enable("ly")
+            else:
+                self.c("systemctl enable ly.service && systemctl mask getty@tty2.service")
 
     # ------------------------------------------------------------------ extras
     def extras(self) -> None:
@@ -563,8 +614,8 @@ class Installer:
         for sub in ("dev", "sys", "proc", "run"):
             r.run(["umount", "-R", f"{t}/{sub}"], check=False, quiet=True)
         r.run(["umount", "-R", t], check=False, quiet=True)
-        if self.swap_dev:
-            r.run(["swapoff", self.swap_dev], check=False, quiet=True)
-        if self.encrypted and self.cfg.disk_mode == "auto":
+        for dev in self.swap_devs:
+            r.run(["swapoff", dev], check=False, quiet=True)
+        if self.encrypted and self.cfg.disk_mode != "premounted":
             r.run(["cryptsetup", "close", CRYPT_NAME], check=False, quiet=True)
         self.chroot_ready = False

@@ -20,15 +20,16 @@ class InstallError(RuntimeError):
     pass
 
 
-# --- colour-coded status output (muted blue accents, white text, no harsh colours) ---
-BLUE, WHITE, DIM, BOLD, RST = "\033[38;5;67m", "\033[97m", "\033[2m", "\033[1m", "\033[0m"
+# --- colour-coded status output: same semantics as archinstall (red error, yellow warning, green info) ---
+GREEN, YELLOW, RED, BOLD, DIM, RST = "\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[2m", "\033[0m"
 
 
 def say(kind: str, msg: str) -> None:
     """kind: step | ok | info | warn | err"""
-    tag = {"step": f"{BLUE}{BOLD}==>{RST}", "ok": f"{BLUE}[ ok ]{RST}", "info": f"{BLUE}[ .. ]{RST}",
-           "warn": f"{BOLD}{WHITE}[warn]{RST}", "err": f"{BOLD}{WHITE}[FAIL]{RST}"}[kind]
-    print(f"{tag} {BOLD + WHITE if kind in ('step', 'err') else WHITE}{msg}{RST}", flush=True)
+    tag = {"step": f"{BOLD}==>{RST}", "ok": f"{GREEN}[ ok ]{RST}", "info": f"{GREEN}[ .. ]{RST}",
+           "warn": f"{YELLOW}[warn]{RST}", "err": f"{RED}[FAIL]{RST}"}[kind]
+    body = {"step": f"{BOLD}{msg}{RST}", "warn": f"{YELLOW}{msg}{RST}", "err": f"{RED}{msg}{RST}"}.get(kind, msg)
+    print(f"{tag} {body}", flush=True)
     log.log({"err": logging.ERROR, "warn": logging.WARNING}.get(kind, logging.INFO), "%s: %s", kind, msg)
 
 
@@ -108,7 +109,13 @@ def detect_gpus() -> set[str]:
         low = line.lower()
         if not any(k in low for k in ("vga", "3d controller", "display controller")):
             continue
-        if "nvidia" in low:
+        if "vmware" in low:
+            found.add("vmware")
+        elif "virtualbox" in low or "innotek" in low:
+            found.add("virtualbox")
+        elif "red hat" in low or "virtio" in low or "qemu" in low:
+            found.add("virtio")
+        elif "nvidia" in low:
             found.add("nvidia")
         elif "advanced micro" in low or "amd" in low or "ati " in low:
             found.add("amd")

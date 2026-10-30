@@ -45,22 +45,25 @@ VIDEO_CARDS = {
     "amd": "amdgpu radeonsi",
     "nvidia": "nvidia",
     "nouveau": "nouveau",
+    "vmware": "vmware",
+    "virtualbox": "virtualbox",
+    "virtio": "virgl",
 }
-# key -> dict(label, profile suffix, packages, display manager (name, package) or None)
+# Shared by every X11 desktop (Arch: xorg-server, xorg-xinit, xorg-xrandr, libx11, libxcb)
+XORG_COMMON = ["x11-base/xorg-server", "x11-apps/xinit", "x11-apps/xrandr",
+               "x11-libs/libX11", "x11-libs/libxcb"]
+# key -> label and Gentoo atoms for the packages archinstall would install
 DESKTOPS = {
-    "plasma": dict(label="KDE Plasma", profile="desktop/plasma",
-                   pkgs=["kde-plasma/plasma-meta", "kde-apps/konsole", "kde-apps/dolphin"],
-                   dm=("sddm", "x11-misc/sddm")),
-    "gnome": dict(label="GNOME", profile="desktop/gnome",
-                  pkgs=["gnome-base/gnome-light"], dm=("gdm", "gnome-base/gdm")),
-    "xfce": dict(label="Xfce", profile="desktop",
-                 pkgs=["xfce-base/xfce4-meta", "x11-base/xorg-server"],
-                 dm=("lightdm", "x11-misc/lightdm")),
-    "i3": dict(label="i3 (X11 tiling)", profile="desktop",
-               pkgs=["x11-wm/i3", "x11-terms/xterm", "x11-base/xorg-server"],
-               dm=("lightdm", "x11-misc/lightdm")),
-    "sway": dict(label="Sway (Wayland tiling)", profile="desktop",
-                 pkgs=["gui-wm/sway", "gui-apps/foot"], dm=None),
+    "i3": dict(label="i3-wm", pkgs=[
+        "x11-wm/i3", "x11-misc/i3status", "x11-misc/dmenu", "x11-misc/i3lock"] + XORG_COMMON),
+    "xfce": dict(label="Xfce", pkgs=[
+        "xfce-base/xfce4-meta", "xfce-base/xfce4-panel", "xfce-base/xfce4-session",
+        "xfce-base/xfce4-settings", "xfce-base/xfdesktop", "xfce-base/xfwm4", "xfce-base/thunar",
+        "x11-terms/xfce4-terminal", "app-editors/mousepad"] + XORG_COMMON),
+}
+GREETERS = {
+    "sddm": "SDDM",
+    "ly": "Ly (TUI greeter; from the GURU overlay, built locally)",
 }
 PROFILE_TYPES = {
     "minimal": "Minimal (base system only)",
@@ -80,8 +83,8 @@ def stage3_flavor(cfg: "Config") -> str:
 
 def profile_name(cfg: "Config") -> str:
     parts = [PROFILE_BASE]
-    if cfg.profile_type == "desktop" and cfg.desktop in DESKTOPS:
-        parts.append(DESKTOPS[cfg.desktop]["profile"])
+    if cfg.profile_type == "desktop":
+        parts.append("desktop")
     if cfg.init_system == "systemd":
         parts.append("systemd")
     return "/".join(parts)
@@ -91,12 +94,14 @@ def profile_name(cfg: "Config") -> str:
 class Config:
     init_system: str = "openrc"
     stage3_desktop: bool = False     # use the stage3-amd64-desktop-* tarball
-    disk_mode: str = "auto"          # auto | premounted
+    disk_mode: str = "default"       # default | manual | premounted
     disk: str = ""
     filesystem: str = "ext4"
     btrfs_subvolumes: bool = True
     encrypt: bool = False
     swap_gib: int = 0
+    separate_home: bool = False
+    partitions: list = field(default_factory=list)   # manual layout (disklayout.Part dicts)
     bootloader: str = "grub"
     removable_boot: bool = False
     kernel: str = "gentoo-kernel-bin"
@@ -106,6 +111,7 @@ class Config:
     keymap: str = "us"
     profile_type: str = "minimal"    # minimal | server | desktop
     desktop: str = ""
+    greeter: str = "sddm"
     graphics: str = "auto"
     audio: str = "none"              # none | pipewire
     network: str = "dhcpcd"
@@ -147,6 +153,8 @@ class Config:
     def load(cls, cfg_path: str, creds_path: str | None = None) -> "Config":
         data = json.loads(Path(cfg_path).read_text())
         known = {f.name for f in fields(cls)} - set(SECRET_KEYS)
+        if data.get("disk_mode") == "auto":      # name used by older configs
+            data["disk_mode"] = "default"
         cfg = cls(**{k: v for k, v in data.items() if k in known})
         cfg.users = [dict(u, password=u.get("password", "")) for u in cfg.users]
         if creds_path:
@@ -163,8 +171,12 @@ def validate(cfg: Config, uefi: bool) -> list[str]:
     errs: list[str] = []
     if cfg.init_system not in INIT_SYSTEMS:
         errs.append(f"Unknown init system '{cfg.init_system}'")
-    if cfg.disk_mode == "auto" and not cfg.disk:
+    if cfg.disk_mode in ("default", "manual") and not cfg.disk:
         errs.append("No target disk selected")
+    if cfg.disk_mode == "manual":
+        from .disklayout import Part, validate_layout
+        errs += validate_layout([Part.from_dict(d) for d in cfg.partitions], uefi=uefi,
+                                bootloader=cfg.bootloader, encrypt=cfg.encrypt)
     if cfg.disk_mode == "premounted" and not uefi and not cfg.disk:
         errs.append("BIOS boot with a pre-mounted layout needs a disk for the bootloader")
     if cfg.filesystem not in FILESYSTEMS:
@@ -177,7 +189,7 @@ def validate(cfg: Config, uefi: bool) -> list[str]:
         errs.append(f"Unknown kernel '{cfg.kernel}'")
     if cfg.network == "systemd-networkd" and cfg.init_system != "systemd":
         errs.append("systemd-networkd requires the systemd init system")
-    if cfg.encrypt and cfg.disk_mode == "auto" and not cfg.luks_password:
+    if cfg.encrypt and cfg.disk_mode != "premounted" and not cfg.luks_password:
         errs.append("Disk encryption is enabled but no passphrase is set")
     if not cfg.root_password:
         errs.append("Root password is not set")
@@ -185,6 +197,8 @@ def validate(cfg: Config, uefi: bool) -> list[str]:
         errs.append("Invalid hostname")
     if cfg.profile_type == "desktop" and cfg.desktop not in DESKTOPS:
         errs.append("Desktop profile selected but no desktop environment chosen")
+    if cfg.profile_type == "desktop" and cfg.greeter not in GREETERS:
+        errs.append("Desktop profile selected but no greeter chosen")
     for u in cfg.users:
         if not USERNAME_RE.match(u.get("username", "")):
             errs.append(f"Invalid username '{u.get('username')}'")
